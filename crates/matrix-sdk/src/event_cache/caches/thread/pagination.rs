@@ -143,9 +143,15 @@ impl PaginatedCache for ThreadEventCacheWrapper {
                 }
 
                 // Otherwise, start back-pagination from the end of the thread.
+                //
+                // Don't wait for an initial previous-batch token: a sync only brings one for a
+                // thread when it brings new events of that thread, so for a thread nobody wrote
+                // in since the sync started, the wait always ran into its timeout and delayed
+                // the first back-pagination by three seconds. `/relations` without a `from`
+                // token starts at the end of the thread anyway.
                 return Ok(LoadMoreEventsBackwardsOutcome::Gap {
                     prev_token: None,
-                    waited_for_initial_prev_token: state.waited_for_initial_prev_token(),
+                    waited_for_initial_prev_token: true,
                 });
             }
 
