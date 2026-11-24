@@ -159,6 +159,26 @@ struct ActiveTask {
     _abort_handle: AbortHandle,
 }
 
+/// Removes a task from the active ones when dropped.
+///
+/// The wrapped future of a task owns it, so the entry is removed however the
+/// task ends: it completes, it panics, or it is aborted and its future is
+/// dropped at an await point.
+struct RemoveOnDrop {
+    active_tasks: Arc<RwLock<HashMap<TaskId, ActiveTask>>>,
+    task_id: TaskId,
+    /// Set when the task has ended, so a task that ends before it is
+    /// registered is not registered at all.
+    ended: Arc<AtomicBool>,
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        self.ended.store(true, Ordering::SeqCst);
+        self.active_tasks.write().remove(&self.task_id);
+    }
+}
+
 /// Default capacity for the failure broadcast channel.
 ///
 /// It doesn't have to be large, because it's expected that consumers of such a
@@ -296,16 +316,22 @@ impl TaskMonitor {
 
         let intentionally_aborted = Arc::new(AtomicBool::new(false));
 
-        let active_tasks = self.active_task_handles.clone();
+        let ended = Arc::new(AtomicBool::new(false));
+        let remove_on_drop = RemoveOnDrop {
+            active_tasks: self.active_task_handles.clone(),
+            task_id,
+            ended: ended.clone(),
+        };
         let failure_sender = self.failure_sender.clone();
         let aborted_flag = intentionally_aborted.clone();
 
         let wrapped = async move {
+            let remove_on_drop = remove_on_drop;
             // SAFETY: see module-level documentation about unwind safety.
             let result = AssertUnwindSafe(future).catch_unwind().await;
 
             // Remove the task from the list of active ones.
-            active_tasks.write().remove(&task_id);
+            drop(remove_on_drop);
 
             // Don't report if intentionally aborted.
             if aborted_flag.load(Ordering::Acquire) {
@@ -340,10 +366,12 @@ impl TaskMonitor {
         let join_handle = spawn(wrapped);
         let abort_handle = join_handle.abort_handle();
 
-        // Register the task.
-        self.active_task_handles
-            .write()
-            .insert(task_id, ActiveTask { _abort_handle: abort_handle.clone() });
+        // Register the task, unless it has already ended: its removal has run.
+        let mut active_tasks = self.active_task_handles.write();
+        if !ended.load(Ordering::SeqCst) {
+            active_tasks.insert(task_id, ActiveTask { _abort_handle: abort_handle.clone() });
+        }
+        drop(active_tasks);
 
         BackgroundTaskHandle { abort_on_drop: false, abort_handle, intentionally_aborted }
     }
@@ -380,14 +408,21 @@ impl TaskMonitor {
 
         let intentionally_aborted = Arc::new(AtomicBool::new(false));
 
-        let active_tasks = self.active_task_handles.clone();
+        let ended = Arc::new(AtomicBool::new(false));
+        let remove_on_drop = RemoveOnDrop {
+            active_tasks: self.active_task_handles.clone(),
+            task_id,
+            ended: ended.clone(),
+        };
         let failure_sender = self.failure_sender.clone();
         let aborted_flag = intentionally_aborted.clone();
 
         let wrapped = async move {
+            let remove_on_drop = remove_on_drop;
             let result = AssertUnwindSafe(future).catch_unwind().await;
 
-            active_tasks.write().remove(&task_id);
+            // Remove the task from the list of active ones.
+            drop(remove_on_drop);
 
             // Don't report if intentionally aborted.
             if aborted_flag.load(Ordering::Acquire) {
@@ -417,10 +452,12 @@ impl TaskMonitor {
         let join_handle = spawn(wrapped);
         let abort_handle = join_handle.abort_handle();
 
-        // Register the task.
-        self.active_task_handles
-            .write()
-            .insert(task_id, ActiveTask { _abort_handle: abort_handle.clone() });
+        // Register the task, unless it has already ended: its removal has run.
+        let mut active_tasks = self.active_task_handles.write();
+        if !ended.load(Ordering::SeqCst) {
+            active_tasks.insert(task_id, ActiveTask { _abort_handle: abort_handle.clone() });
+        }
+        drop(active_tasks);
 
         BackgroundTaskHandle { abort_on_drop: false, abort_handle, intentionally_aborted }
     }
@@ -535,6 +572,44 @@ mod tests {
 
     use super::{BackgroundTaskFailureReason, TaskMonitor};
     use crate::{sleep::sleep, timeout::timeout};
+
+    #[async_test]
+    async fn test_aborted_task_is_removed() {
+        let monitor = TaskMonitor::new();
+
+        let handle =
+            monitor.spawn_infinite_task("test_task", std::future::pending::<()>()).abort_on_drop();
+        assert_eq!(monitor.active_task_handles.read().len(), 1);
+
+        drop(handle);
+        let removed = timeout(
+            async {
+                while !monitor.active_task_handles.read().is_empty() {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(removed.is_ok(), "the aborted task is still among the active ones");
+    }
+
+    #[async_test]
+    async fn test_finished_task_is_removed() {
+        let monitor = TaskMonitor::new();
+
+        let handle = monitor.spawn_finite_task("test_task", async {});
+        let removed = timeout(
+            async {
+                while !(handle.is_finished() && monitor.active_task_handles.read().is_empty()) {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(removed.is_ok(), "the finished task is still among the active ones");
+    }
 
     #[async_test]
     async fn test_early_termination_is_reported() {
