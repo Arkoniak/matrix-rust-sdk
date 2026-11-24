@@ -80,7 +80,7 @@ use std::{
 
 use futures_util::FutureExt;
 use tokio::sync::broadcast;
-use tracing::{Instrument, Span};
+use tracing::{Instrument, Span, debug};
 
 use crate::{
     SendOutsideWasm,
@@ -166,16 +166,30 @@ struct ActiveTask {
 /// dropped at an await point.
 struct RemoveOnDrop {
     active_tasks: Arc<RwLock<HashMap<TaskId, ActiveTask>>>,
-    task_id: TaskId,
+    task: BackgroundTaskInfo,
     /// Set when the task has ended, so a task that ends before it is
     /// registered is not registered at all.
     ended: Arc<AtomicBool>,
+    /// Whether the task's future ran to its end, rather than being dropped
+    /// at an await point (an abort, or the runtime shutting down).
+    completed: bool,
 }
 
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         self.ended.store(true, Ordering::SeqCst);
-        self.active_tasks.write().remove(&self.task_id);
+        let mut active_tasks = self.active_tasks.write();
+        let registered = active_tasks.remove(&self.task.id).is_some();
+        let active = active_tasks.len();
+        drop(active_tasks);
+        debug!(
+            task_id = ?self.task.id,
+            name = %self.task.name,
+            how = if self.completed { "completed" } else { "dropped" },
+            registered,
+            active,
+            "background task ended"
+        );
     }
 }
 
@@ -313,24 +327,27 @@ impl TaskMonitor {
         let name = name.into();
         let task_id = TaskId::new();
         let task_info = BackgroundTaskInfo { id: task_id, name };
+        let handle_task = task_info.clone();
 
         let intentionally_aborted = Arc::new(AtomicBool::new(false));
 
         let ended = Arc::new(AtomicBool::new(false));
         let remove_on_drop = RemoveOnDrop {
             active_tasks: self.active_task_handles.clone(),
-            task_id,
+            task: task_info.clone(),
             ended: ended.clone(),
+            completed: false,
         };
         let failure_sender = self.failure_sender.clone();
         let aborted_flag = intentionally_aborted.clone();
 
         let wrapped = async move {
-            let remove_on_drop = remove_on_drop;
+            let mut remove_on_drop = remove_on_drop;
             // SAFETY: see module-level documentation about unwind safety.
             let result = AssertUnwindSafe(future).catch_unwind().await;
 
             // Remove the task from the list of active ones.
+            remove_on_drop.completed = true;
             drop(remove_on_drop);
 
             // Don't report if intentionally aborted.
@@ -368,12 +385,20 @@ impl TaskMonitor {
 
         // Register the task, unless it has already ended: its removal has run.
         let mut active_tasks = self.active_task_handles.write();
-        if !ended.load(Ordering::SeqCst) {
+        let registered = !ended.load(Ordering::SeqCst);
+        if registered {
             active_tasks.insert(task_id, ActiveTask { _abort_handle: abort_handle.clone() });
         }
+        let active = active_tasks.len();
         drop(active_tasks);
+        debug!(task_id = ?task_id, name = %handle_task.name, registered, active, "background task spawned");
 
-        BackgroundTaskHandle { abort_on_drop: false, abort_handle, intentionally_aborted }
+        BackgroundTaskHandle {
+            task: handle_task,
+            abort_on_drop: false,
+            abort_handle,
+            intentionally_aborted,
+        }
     }
 
     /// Spawn a background task that returns a `Result`.
@@ -405,23 +430,26 @@ impl TaskMonitor {
         let name = name.into();
         let task_id = TaskId::new();
         let task_info = BackgroundTaskInfo { id: task_id, name };
+        let handle_task = task_info.clone();
 
         let intentionally_aborted = Arc::new(AtomicBool::new(false));
 
         let ended = Arc::new(AtomicBool::new(false));
         let remove_on_drop = RemoveOnDrop {
             active_tasks: self.active_task_handles.clone(),
-            task_id,
+            task: task_info.clone(),
             ended: ended.clone(),
+            completed: false,
         };
         let failure_sender = self.failure_sender.clone();
         let aborted_flag = intentionally_aborted.clone();
 
         let wrapped = async move {
-            let remove_on_drop = remove_on_drop;
+            let mut remove_on_drop = remove_on_drop;
             let result = AssertUnwindSafe(future).catch_unwind().await;
 
             // Remove the task from the list of active ones.
+            remove_on_drop.completed = true;
             drop(remove_on_drop);
 
             // Don't report if intentionally aborted.
@@ -454,12 +482,20 @@ impl TaskMonitor {
 
         // Register the task, unless it has already ended: its removal has run.
         let mut active_tasks = self.active_task_handles.write();
-        if !ended.load(Ordering::SeqCst) {
+        let registered = !ended.load(Ordering::SeqCst);
+        if registered {
             active_tasks.insert(task_id, ActiveTask { _abort_handle: abort_handle.clone() });
         }
+        let active = active_tasks.len();
         drop(active_tasks);
+        debug!(task_id = ?task_id, name = %handle_task.name, registered, active, "background task spawned");
 
-        BackgroundTaskHandle { abort_on_drop: false, abort_handle, intentionally_aborted }
+        BackgroundTaskHandle {
+            task: handle_task,
+            abort_on_drop: false,
+            abort_handle,
+            intentionally_aborted,
+        }
     }
 }
 
@@ -470,6 +506,9 @@ impl TaskMonitor {
 /// failure.
 #[derive(Debug)]
 pub struct BackgroundTaskHandle {
+    /// The task's id and name, for the log.
+    task: BackgroundTaskInfo,
+
     /// The underlying tokio's [`AbortHandle`].
     abort_handle: AbortHandle,
 
@@ -511,6 +550,12 @@ impl BackgroundTaskHandle {
         // before the flag is set, and the task monitor would consider this an
         // unexpected termination.
         self.intentionally_aborted.store(true, Ordering::Release);
+        debug!(
+            task_id = ?self.task.id,
+            name = %self.task.name,
+            finished = self.is_finished(),
+            "background task aborted"
+        );
         self.abort_handle.abort();
     }
 
